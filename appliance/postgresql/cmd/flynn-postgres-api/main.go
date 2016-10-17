@@ -11,10 +11,11 @@ import (
 	"github.com/flynn/flynn/pkg/provider"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/shutdown"
+	sirenia "github.com/flynn/flynn/pkg/sirenia/client"
+	"github.com/flynn/flynn/pkg/sirenia/state"
 	"github.com/flynn/flynn/pkg/status/protobuf"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
 )
 
 const (
@@ -27,13 +28,16 @@ WHERE pg_stat_activity.datname = $1
 )
 
 var serviceName = os.Getenv("FLYNN_POSTGRES")
+var singleton = os.Getenv("SINGLETON")
 var serviceHost string
+var serviceAddr string
 
 func init() {
 	if serviceName == "" {
 		serviceName = "postgres"
 	}
 	serviceHost = fmt.Sprintf("leader.%s.discoverd", serviceName)
+	serviceAddr = serviceHost + ":5432"
 }
 
 func main() {
@@ -51,11 +55,11 @@ func main() {
 		Password: os.Getenv("PGPASSWORD"),
 		Database: "postgres",
 	}, nil)
+
 	s := grpc.NewServer()
 	rpcServer := &server{db}
 	provider.RegisterProviderServer(s, rpcServer)
 	status.RegisterStatusServer(s, rpcServer)
-	reflection.Register(s)
 
 	l, err := net.Listen("tcp", ":"+port)
 	if err != nil {
@@ -71,7 +75,7 @@ func main() {
 	shutdown.Fatal(s.Serve(l))
 }
 
-// server implements the Provider service
+// server implements the Provider and Status services
 type server struct {
 	db *postgres.DB
 }
@@ -92,7 +96,7 @@ func (p *server) Provision(ctx context.Context, _ *provider.ProvisionRequest) (*
 		return nil, err
 	}
 
-	url := fmt.Sprintf("postgres://%s:%s@%s:5432/%s", username, password, serviceHost, database)
+	url := fmt.Sprintf("postgres://%s:%s@%s/%s", username, password, serviceAddr, database)
 	return &provider.ProvisionReply{
 		Id: fmt.Sprintf("/databases/%s:%s", username, database),
 		Env: map[string]string{
@@ -131,6 +135,32 @@ func (p *server) Deprovision(ctx context.Context, req *provider.DeprovisionReque
 		return reply, err
 	}
 	return reply, nil
+}
+
+func (p *server) GetTunables(ctx context.Context, req *provider.GetTunablesRequest) (*provider.GetTunablesReply, error) {
+	reply := &provider.GetTunablesReply{}
+	sc := sirenia.NewClient(serviceAddr)
+	tunables, err := sc.GetTunables()
+	if err != nil {
+		return reply, err
+	}
+	reply.Tunables = tunables.Data
+	reply.Version = tunables.Version
+	return reply, nil
+}
+
+func (p *server) UpdateTunables(ctx context.Context, req *provider.UpdateTunablesRequest) (*provider.UpdateTunablesReply, error) {
+	reply := &provider.UpdateTunablesReply{}
+	if singleton == "true" {
+		return reply, fmt.Errorf("Tunables can't be updated on singleton clusters")
+	}
+	update := &state.Tunables{
+		Data:    req.Tunables,
+		Version: req.Version,
+	}
+	sc := sirenia.NewClient(serviceAddr)
+	err := sc.UpdateTunables(update)
+	return reply, err
 }
 
 func (p *server) Status(ctx context.Context, _ *status.StatusRequest) (*status.StatusReply, error) {
